@@ -24,6 +24,11 @@ from providers.exceptions import (
     ServiceUnavailableError,
     UnknownProviderTypeError,
 )
+from providers.model_cache_persistence import (
+    clear_cache_file,
+    load_cached_model_infos,
+    save_model_infos,
+)
 from providers.model_listing import ProviderModelInfo, model_infos_from_ids
 
 ProviderFactory = Callable[[ProviderConfig, Settings], BaseProvider]
@@ -227,6 +232,26 @@ class ProviderRegistry:
         self._model_ids_by_provider: dict[str, frozenset[str]] = {}
         self._model_infos_by_provider: dict[str, dict[str, ProviderModelInfo]] = {}
         self._model_list_refresh_task: asyncio.Task[None] | None = None
+        self._periodic_refresh_task: asyncio.Task[None] | None = None
+        self._load_cache_from_disk()
+
+    def _load_cache_from_disk(self) -> None:
+        """Hydrate the in-memory cache from disk so cold starts are instant."""
+        cached_infos, saved_at = load_cached_model_infos()
+        if not cached_infos:
+            return
+        for provider_id, infos in cached_infos.items():
+            self._model_infos_by_provider[provider_id] = dict(infos)
+            self._model_ids_by_provider[provider_id] = frozenset(infos)
+        logger.info(
+            "Provider model discovery hydrated from disk: providers={} saved_at={}",
+            len(cached_infos),
+            saved_at,
+        )
+
+    def _persist_cache_to_disk(self) -> None:
+        """Mirror the in-memory cache to disk for the next cold start."""
+        save_model_infos(self._model_infos_by_provider)
 
     def is_cached(self, provider_id: str) -> bool:
         """Return whether a provider for this id is already in the cache."""
@@ -350,6 +375,7 @@ class ProviderRegistry:
             return
 
         results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+        any_success = False
         for (provider_id, _task), result in zip(tasks.items(), results, strict=True):
             if isinstance(result, BaseException):
                 if isinstance(result, asyncio.CancelledError):
@@ -357,11 +383,57 @@ class ProviderRegistry:
                 _log_model_discovery_failure(provider_id, result, settings)
                 continue
             self.cache_model_infos(provider_id, result)
+            any_success = True
             logger.info(
                 "Provider model discovery cached: provider={} models={}",
                 provider_id,
                 len(result),
             )
+
+        if any_success:
+            self._persist_cache_to_disk()
+
+    def start_periodic_model_list_refresh(
+        self, settings: Settings, *, interval_seconds: float
+    ) -> None:
+        """Start a background task that refreshes every provider on a timer."""
+        if interval_seconds <= 0:
+            return
+        if (
+            self._periodic_refresh_task is not None
+            and not self._periodic_refresh_task.done()
+        ):
+            return
+
+        async def _loop() -> None:
+            try:
+                while True:
+                    await asyncio.sleep(interval_seconds)
+                    try:
+                        await self.refresh_model_list_cache(settings, only_missing=False)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.warning(
+                            "Periodic model refresh failed: exc_type={}",
+                            type(exc).__name__,
+                        )
+            except asyncio.CancelledError:
+                raise
+
+        self._periodic_refresh_task = asyncio.create_task(_loop())
+
+    async def force_refresh_all(self, settings: Settings) -> dict[str, int]:
+        """Synchronously refresh every eligible provider; return cached counts."""
+        await self.refresh_model_list_cache(settings, only_missing=False)
+        return {
+            provider_id: len(infos)
+            for provider_id, infos in self._model_infos_by_provider.items()
+        }
+
+    def clear_disk_cache(self) -> bool:
+        """Delete the on-disk cache file (in-memory cache is untouched)."""
+        return clear_cache_file()
 
     async def validate_configured_models(self, settings: Settings) -> None:
         """Fail fast unless every configured chat model exists upstream."""
@@ -428,6 +500,14 @@ class ProviderRegistry:
             self._model_list_refresh_task.cancel()
             with suppress(asyncio.CancelledError):
                 await self._model_list_refresh_task
+
+        if (
+            self._periodic_refresh_task is not None
+            and not self._periodic_refresh_task.done()
+        ):
+            self._periodic_refresh_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._periodic_refresh_task
 
         items = list(self._providers.items())
         errors: list[Exception] = []

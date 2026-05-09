@@ -254,6 +254,32 @@ async def list_models(
     return _build_models_list_response(settings, provider_registry)
 
 
+@router.post("/v1/models/refresh")
+async def refresh_models(
+    request: Request,
+    settings: Settings = Depends(get_settings),
+    _auth=Depends(require_api_key),
+):
+    """Force a synchronous refresh of the provider model-discovery cache."""
+    registry = getattr(request.app.state, "provider_registry", None)
+    if not isinstance(registry, ProviderRegistry):
+        raise HTTPException(
+            status_code=503, detail="Provider registry not initialized"
+        )
+    try:
+        counts = await registry.force_refresh_all(settings)
+    except Exception as exc:
+        logger.warning(
+            "Manual model refresh failed: exc_type={}", type(exc).__name__
+        )
+        raise HTTPException(status_code=502, detail="Refresh failed") from exc
+    return {
+        "status": "ok",
+        "providers": counts,
+        "total": sum(counts.values()),
+    }
+
+
 @router.post("/stop")
 async def stop_cli(request: Request, _auth=Depends(require_api_key)):
     """Stop all CLI sessions and pending tasks."""

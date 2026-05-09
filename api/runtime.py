@@ -21,6 +21,31 @@ if TYPE_CHECKING:
     from messaging.session import SessionStore
 
 _SHUTDOWN_TIMEOUT_S = 5.0
+_DEFAULT_PERIODIC_REFRESH_HOURS = 6.0
+_PERIODIC_REFRESH_ENV = "FCC_MODEL_REFRESH_HOURS"
+
+
+def _periodic_refresh_interval_seconds() -> float:
+    """Read the periodic model-refresh interval from env (hours -> seconds).
+
+    Returns 0 to disable. Default is 6 hours.
+    """
+    raw = os.environ.get(_PERIODIC_REFRESH_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_PERIODIC_REFRESH_HOURS * 3600.0
+    try:
+        hours = float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid {} value: {!r} — falling back to default {}h",
+            _PERIODIC_REFRESH_ENV,
+            raw,
+            _DEFAULT_PERIODIC_REFRESH_HOURS,
+        )
+        return _DEFAULT_PERIODIC_REFRESH_HOURS * 3600.0
+    if hours <= 0:
+        return 0.0
+    return hours * 3600.0
 
 
 async def best_effort(
@@ -106,6 +131,10 @@ class AppRuntime:
             warn_if_process_auth_token(self.settings)
             await self._provider_registry.validate_configured_models(self.settings)
             self._provider_registry.start_model_list_refresh(self.settings)
+            self._provider_registry.start_periodic_model_list_refresh(
+                self.settings,
+                interval_seconds=_periodic_refresh_interval_seconds(),
+            )
             await self._start_messaging_if_configured()
             self._publish_state()
         except Exception as exc:
